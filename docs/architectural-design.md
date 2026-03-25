@@ -296,3 +296,248 @@ sh.getBalancerState()
 - **products** — хешированное шардирование по _id для равномерной нагрузки
 - **orders** — хешированное шардирование по user_id для локальности истории
 - **carts** — диапазонное шардирование по { status, user_id } для изоляции активных данных
+
+## Задание 8. Выявление и устранение «горячих» шардов
+
+### 1. Проблема: «горячие» шарды
+
+В текущей архитектуре коллекция `products` шардирована по `{ _id: "hashed" }`. Это обеспечивает равномерное распределение документов, но **не решает проблему неравномерной нагрузки на уровне запросов**. Категория «Электроника» генерирует 70% всех запросов, что создает непропорциональную нагрузку на шарды, где хранятся эти документы.
+
+**Корень проблемы:** Даже при равномерном распределении документов, запросы к популярным документам могут создавать «горячие» точки (hot spots) на конкретных шардах.
+
+### 2. Метрики мониторинга для выявления «горячих» шардов
+
+| Категория | Метрика | Описание | Порог срабатывания | Источник данных |
+|-----------|---------|----------|-------------------|-----------------|
+| **Нагрузка на шарды** | `shard_query_rate` | Количество запросов в секунду на шард | > 20% от общего трафика на один шард | mongos logs, `db.currentOp()` |
+| | `shard_cpu_usage` | Использование CPU на узлах шарда | > 80% в течение 5 минут | Docker stats, Prometheus |
+| | `shard_io_wait` | Время ожидания ввода-вывода | > 50ms | iostat, mongostat |
+| | `shard_lock_percentage` | Процент времени блокировок | > 30% | `db.serverStatus().locks` |
+| **Размер данных** | `chunk_size_distribution` | Размер chunk'ов по шардам | Разница > 20% | `sh.status()` |
+| | `documents_per_shard` | Количество документов на шард | Разница > 20% | `sh.status()` |
+| **Тепловые карты** | `hot_collection_reads` | Частота чтения коллекции по шардам | > 50% на один шард | `db.collection.getShardDistribution()` |
+| | `query_pattern_by_category` | Распределение запросов по категориям | 70% на одну категорию | Логи приложения, APM |
+| **Операционные** | `migration_queue_length` | Длина очереди миграций | > 10 | `sh.getBalancerState()` |
+| | `balancer_runtime` | Время работы балансировщика | > 10 минут | `sh.status()` |
+
+### 3. Команды для сбора метрик
+
+#### 3.1. Проверка распределения документов и chunk'ов
+
+```javascript
+// Общая статистика шардирования
+sh.status()
+
+// Распределение chunk'ов по шардам
+db.getSiblingDB("config").chunks.aggregate([
+  { $match: { ns: "somedb.products" } },
+  { $group: { _id: "$shard", count: { $sum: 1 } } }
+])
+
+// Размер данных по шардам для коллекции products
+db.products.getShardDistribution()
+```
+
+#### 3.2. Мониторинг нагрузки на шарды
+```
+// Текущие операции на всех шардах
+db.currentOp({ active: true })
+
+// Статистика блокировок
+db.serverStatus().locks
+
+// Статистика операций ввода-вывода
+db.serverStatus().opLatencies
+
+// Использование соединений
+db.serverStatus().connections
+```
+
+#### 3.3. Выявление «горячих» документов
+```
+// Анализ доступа к коллекции (требует включенного profiling)
+db.setProfilingLevel(2, 100)  // Логировать запросы > 100ms
+
+// Просмотр медленных запросов
+db.system.profile.find({ ns: "somedb.products" }).sort({ ts: -1 }).limit(50)
+
+// Анализ частоты доступа к документам по категориям (на уровне приложения)
+// Рекомендуется использовать APM (New Relic, Datadog) или логи приложения
+```
+
+### 4. Механизмы устранения дисбаланса
+
+#### 4.1. Автоматическая балансировка (встроенная)
+MongoDB имеет встроенный балансировщик, который автоматически перемещает chunk'и между шардами.
+```
+// Включить балансировщик (по умолчанию включен)
+sh.startBalancer()
+
+// Настроить окно балансировки (например, ночное время)
+db.getSiblingDB("config").settings.updateOne(
+  { _id: "balancer" },
+  { $set: { activeWindow: { start: "01:00", stop: "05:00" } } },
+  { upsert: true }
+)
+
+// Проверить статус балансировки
+sh.getBalancerState()
+```
+
+#### 4.2. Zone Sharding для изоляции популярных категорий
+В качестве решения предлагаю создать отдельные зоны для популярных категорий и разместить их на выделенных шардах.
+```
+// Добавить зоны для популярных категорий
+sh.addShardToZone("shard1ReplSet", "high_demand_zone")
+sh.addShardToZone("shard2ReplSet", "high_demand_zone")
+
+// Определить диапазоны для популярных категорий
+// Используем поле category как префикс шард-ключа
+sh.updateZoneKeyRange(
+  "somedb.products",
+  { category: "Electronics", _id: MinKey() },
+  { category: "Electronics", _id: MaxKey() },
+  "high_demand_zone"
+)
+
+sh.updateZoneKeyRange(
+  "somedb.products",
+  { category: "Smartphones", _id: MinKey() },
+  { category: "Smartphones", _id: MaxKey() },
+  "high_demand_zone"
+)
+```
+
+#### 4.3. Смена шард-ключа (как крайняя мера)
+Если дисбаланс становится критическим, можно изменить шард-ключ на композитный с префиксом `category`.
+```
+// 1. Создать новый индекс
+db.products.createIndex({ category: 1, _id: "hashed" })
+
+// 2. Пересоздать коллекцию с новым шард-ключом (требуется даунтайм)
+//    - Экспортировать данные
+//    - Удалить коллекцию
+//    - Создать с новым шард-ключом
+//    - Импортировать данные
+
+// Альтернатива: refactoring with mongodump/mongorestore
+```
+
+#### 4.4. Денормализация и кэширование
+Для снижения нагрузки на популярные категории:
+```
+// Создать агрегированную коллекцию для популярных категорий
+db.hot_products_cache.createIndex({ category: 1, price: 1 })
+
+// Обновлять кэш через Change Streams
+const changeStream = db.products.watch();
+changeStream.on("change", (change) => {
+  // Обновить кэшированную коллекцию
+  syncHotProductsCache(change);
+});
+```
+
+#### 4.5. Стратегия Read Preference для распределения нагрузки
+Настроить чтение с реплик для балансировки нагрузки:
+```
+// На уровне приложения: использовать secondary для аналитических запросов
+MONGODB_URL: "mongodb://mongos:27017?readPreference=secondaryPreferred"
+```
+
+### 5. Автоматизация реагирования
+
+#### 5.1. Скрипт автоматического реагирования
+```
+// auto_rebalance.js - скрипт для мониторинга и автоматического реагирования
+
+function checkShardBalance() {
+  const chunks = db.getSiblingDB("config").chunks.aggregate([
+    { $match: { ns: "somedb.products" } },
+    { $group: { _id: "$shard", count: { $sum: 1 } } }
+  ]).toArray();
+  
+  if (chunks.length < 2) return;
+  
+  const maxCount = Math.max(...chunks.map(c => c.count));
+  const minCount = Math.min(...chunks.map(c => c.count));
+  const imbalanceRatio = (maxCount - minCount) / maxCount;
+  
+  if (imbalanceRatio > 0.2) {
+    print(`WARNING: Shard imbalance detected: ${imbalanceRatio * 100}%`);
+    
+    // Проверить, включен ли балансировщик
+    const balancerState = sh.getBalancerState();
+    if (!balancerState) {
+      print("Starting balancer...");
+      sh.startBalancer();
+    }
+  }
+}
+
+// Проверять каждые 5 минут
+setInterval(checkShardBalance, 300000);
+```
+
+#### 5.2. Prometheus + Alertmanager конфигурация
+```
+# prometheus/alerts.yml
+groups:
+  - name: mongodb_sharding_alerts
+    interval: 30s
+    rules:
+      - alert: ShardImbalance
+        expr: |
+          (
+            max by (shard) (mongodb_chunks_total{collection="products"}) 
+            - 
+            min by (shard) (mongodb_chunks_total{collection="products"})
+          ) 
+          / 
+          avg by (shard) (mongodb_chunks_total{collection="products"}) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Shard imbalance detected"
+          description: "Chunk distribution is imbalanced by {{ $value }}%"
+      
+      - alert: HotShard
+        expr: |
+          rate(mongodb_op_counters_total{type="query"}[5m]) 
+          / 
+          sum(rate(mongodb_op_counters_total{type="query"}[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Hot shard detected"
+          description: "Shard {{ $labels.shard }} handles >50% of all queries"
+```
+
+### 6. План действий при обнаружении «горячего» шарда
+| Шаг | Действие | Команда/Инструмент | Время выполнения |
+|-----|----------|-------------------|------------------|
+| 1 | Обнаружение | Alertmanager / Grafana | Автоматически |
+| 2 | Диагностика | `sh.status()` | < 1 мин |
+| 3 | Включение балансировщика | `sh.startBalancer()` | < 1 мин |
+| 4 | Ручной сплит chunk'ов (если необходимо) | `sh.splitAt()` | < 5 мин |
+| 5 | Проверка результатов | `sh.status()` | < 1 мин |
+| 6 | Применение zone sharding (долгосрочное) | `sh.updateZoneKeyRange()` | < 10 мин |
+| 7 | Анализ запросов | `db.system.profile.find()` | < 10 мин |
+| 8 | Оптимизация индексов (при необходимости) | `db.collection.createIndex()` | < 15 мин |
+
+### 7. Рекомендации по предотвращению
+1. **Проектирование шард-ключа с учетом запросов** — для `products` рассмотреть композитный ключ `{ category: 1, _id: "hashed" }`
+2. **Zone sharding для популярных категорий** — выделить отдельные зоны для высоконагруженных категорий
+3. **Кэширование** — использовать **Redis** для кэширования популярных товаров
+4. **Аналитическая реплика** — выделить отдельную реплику для аналитических запросов
+5. **Rate limiting** — ограничить частоту запросов к популярным категориям на уровне API Gateway
+
+
+Разработанные метрики и механизмы позволяют:
+| Цель | Реализация |
+|------|------------|
+| **Выявление** | 12 метрик мониторинга с порогами срабатывания |
+| **Автоматическое реагирование** | Встроенный балансировщик MongoDB + Prometheus alerts |
+| **Долгосрочное решение** | Zone sharding для изоляции популярных категорий |
+| **Профилактика** | Композитный шард-ключ, кэширование, аналитические реплики |
